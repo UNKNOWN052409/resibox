@@ -1,0 +1,5 @@
+target/
+accounts.txt
+proxies.txt
+config.toml
+*.log

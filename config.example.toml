@@ -1,0 +1,52 @@
+# resibox configuration
+# One [[container]] = one isolated runtime = ONE assigned residential proxy.
+# A container NEVER uses, inherits, or falls back to another container's proxy.
+
+[general]
+# HTTP health/dashboard endpoint (0 disables)
+health_port = 8080
+# How often the watchdog re-verifies egress identity per container
+verify_interval_secs = 60
+# Verification endpoints (fetched THROUGH the assigned proxy for egress checks,
+# DIRECTLY for host/leak baseline). Any JSON endpoint with ip/country fields works.
+verify_url = "http://ip-api.com/json/?fields=query,countryCode"
+verify_ip_field = "query"
+verify_country_field = "countryCode"
+verify_direct_url = "http://ip-api.com/json/?fields=query,countryCode"
+# enforcement: "auto" (netns if root, else userspace) | "netns" | "userspace"
+enforcement = "auto"
+# Consecutive watchdog failures before a container is marked BLOCKED
+max_consecutive_failures = 3
+# TCP DNS resolvers used by the per-container DNS relay (queried THROUGH the proxy)
+dns_resolvers = ["9.9.9.9:53", "1.1.1.1:53"]
+
+# ---------------------------------------------------------------- containers
+
+[[container]]
+name = "uk-a"
+proxy = "socks5://user:pass@gw.provider.com:1080"     # UK residential
+expected_ip = ""            # optional: pin exact IP (strongest guarantee)
+expected_country = "GB"     # optional: ISO code geo check
+honeygain_email = "you@example.com"
+honeygain_pass = "secret"
+honeygain_device = "HG-UK-A"
+pawns_email = "you@example.com"
+pawns_pass = "secret"
+pawns_device_name = "PB-UK-A"
+
+# Optional authorized replacements, tried IN ORDER only if the current
+# endpoint is confirmed dead/unusable. IP stays sticky otherwise.
+[[container.replacement]]
+proxy = "socks5://user:pass2@gw.provider.com:1080"
+expected_country = "GB"
+
+[[container]]
+name = "fr-b"
+proxy = "http://user:pass@fr-gw.provider.com:443"     # French residential (HTTP CONNECT)
+expected_country = "FR"
+honeygain_email = "other@example.com"
+honeygain_pass = "secret2"
+honeygain_device = "HG-FR-B"
+pawns_email = "other@example.com"
+pawns_pass = "secret2"
+pawns_device_name = "PB-FR-B"

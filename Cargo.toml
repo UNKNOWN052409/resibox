@@ -1,0 +1,24 @@
+[package]
+name = "resibox"
+version = "1.0.0"
+edition = "2021"
+description = "Rust-based isolated residential-IP container runtime for Honeygain + Pawns.app"
+
+[dependencies]
+tokio = { version = "1", features = ["full", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+[lib]
+name = "resibox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "resibox"
+path = "src/main.rs"
