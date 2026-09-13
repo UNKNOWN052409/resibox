@@ -11,11 +11,15 @@
 use crate::config::{ContainerCfg, Enforcement, General};
 use crate::netns::NetNs;
 use crate::proxy::{parse_proxy, ProxyUrl};
-use crate::verify::{http_get_direct, parse_observation, verify, Observation, Policy, VerifyOutcome};
+use crate::verify::{verify, Observation, Policy, VerifyOutcome};
 use anyhow::{anyhow, Context, Result};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::Child;
+
+/// All container names from the config — set once at startup (main.rs) so
+/// per-container subnet/veth index allocation can avoid hash collisions.
+pub static CONTAINER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
@@ -101,13 +105,6 @@ fn which_ok(bin: &str) -> bool {
     }) || std::path::Path::new("/usr/sbin").join(bin).exists()
 }
 
-async fn host_baseline(g: &General) -> Result<Option<Observation>> {
-    let body = http_get_direct(&g.verify_direct_url, Duration::from_secs(15)).await?;
-    let obs = parse_observation(&body, &g.verify_ip_field, &g.verify_country_field)?;
-    tracing::info!(ip = %obs.ip, "host datacenter baseline learned");
-    Ok(Some(obs))
-}
-
 /// Main loop for one container.
 pub async fn run_container(cs: Arc<ContainerState>, g: Arc<General>, baseline: Option<Observation>) {
     let mut procs = Procs { hg: None, pawns: None, inner_fwd: None, netns: None };
@@ -119,30 +116,28 @@ pub async fn run_container(cs: Arc<ContainerState>, g: Arc<General>, baseline: O
     let endpoints: Arc<Mutex<Vec<Endpoint>>> = Arc::new(Mutex::new(vec![]));
 
     'outer: loop {
-        // ---- gather current candidate endpoint ----------------------------
-        let ep = {
-            let list = endpoints.lock().unwrap();
-            list.first().cloned()
-        };
-        let ep = match ep {
-            Some(e) => e,
-            None => {
-                // first run / after exhausting replacements: rebuild from config
-                let mut list = vec![Endpoint {
-                    url: cs.cfg.proxy.clone(),
-                    policy: Policy::from_cfg(&cs.cfg.expected_ip, &cs.cfg.expected_country),
-                }];
-                for r in &cs.cfg.replacement {
-                    list.push(Endpoint {
-                        url: r.proxy.clone(),
-                        policy: Policy::from_cfg(&r.expected_ip, &r.expected_country),
-                    });
-                }
-                let e = list.remove(0);
-                *endpoints.lock().unwrap() = list;
-                e
+    // ---- gather current candidate endpoint ----------------------------
+    // The list holds ALL authorized endpoints, active one first. It is only
+    // reseeded from config when empty (first run); rotation advances by
+    // dropping a dead head, so a non-rotation failure always retries the
+    // SAME endpoint (IP-stability guarantee).
+    let ep = {
+        let mut list = endpoints.lock().unwrap();
+        if list.is_empty() {
+            let mut seeded = vec![Endpoint {
+                url: cs.cfg.proxy.clone(),
+                policy: Policy::from_cfg(&cs.cfg.expected_ip, &cs.cfg.expected_country),
+            }];
+            for r in &cs.cfg.replacement {
+                seeded.push(Endpoint {
+                    url: r.proxy.clone(),
+                    policy: Policy::from_cfg(&r.expected_ip, &r.expected_country),
+                });
             }
-        };
+            *list = seeded;
+        }
+        list[0].clone()
+    };
 
         let proxy = match parse_proxy(&ep.url) {
             Ok(p) => Arc::new(p),
@@ -225,26 +220,26 @@ pub async fn run_container(cs: Arc<ContainerState>, g: Arc<General>, baseline: O
         }
 
         // ---- WATCHDOG ------------------------------------------------------
-        // Sleep is split into keep-alive chunks: each tiny request goes out
-        // through the SAME sticky url, holding the exit-IP binding warm so
-        // the provider keeps handing us the same residential IP.
-        loop {
-            {
-                let ka = g.keepalive_secs.clamp(5, 300);
-                let total = g.verify_interval_secs.max(ka);
-                let mut slept = 0u64;
-                while slept < total {
-                    let chunk = ka.min(total - slept);
-                    tokio::time::sleep(Duration::from_secs(chunk)).await;
-                    slept += chunk;
-                    let _ = crate::verify::http_get_via_proxy(
-                        &proxy,
-                        &g.keepalive_url,
-                        Duration::from_secs(8),
-                    )
-                    .await;
+            // Sleep is split into keep-alive chunks: each tiny request goes out
+            // through the SAME sticky url, holding the exit-IP binding warm so
+            // the provider keeps handing us the same residential IP.
+            loop {
+                {
+                    let ka = g.keepalive_secs.clamp(5, 300);
+                    let total = g.verify_interval_secs.max(1);
+                    let mut slept = 0u64;
+                    while slept < total {
+                        let chunk = ka.min(total - slept);
+                        tokio::time::sleep(Duration::from_secs(chunk)).await;
+                        slept += chunk;
+                        let _ = crate::verify::http_get_via_proxy(
+                            &proxy,
+                            &g.keepalive_url,
+                            Duration::from_secs(8),
+                        )
+                        .await;
+                    }
                 }
-            }
 
             // DEVICE CONFLICT: old session still registered server-side.
             // Rotate to a persisted-but-fresh device id and recycle.
@@ -328,6 +323,8 @@ pub async fn run_container(cs: Arc<ContainerState>, g: Arc<General>, baseline: O
                     // Revalidate same endpoint; resume ONLY after a clean pass.
                     match verify(&proxy, &ep.policy, &baseline, &g).await {
                         VerifyOutcome::Pass { observed } => {
+                            *cs.failures.lock().unwrap() = 0;
+                            *cs.last_error.lock().unwrap() = String::new();
                             tracing::info!(container = %cs.cfg.name, ip = %observed.ip, "revalidated — resuming");
                             match spawn_apps(&cs, &procs, mode == Enforcement::Netns).await {
                                 Ok((hg, pb)) => {
@@ -373,6 +370,13 @@ async fn should_rotate(_cs: &Arc<ContainerState>, reason: &str) -> bool {
         || r.contains("connect failed")
         || r.contains("refused method")
         || r.contains("closed during connect")
+        // raw connect errors surfaced by our proxy client:
+        //   "tcp connect to proxy host:port" / "timeout connecting via proxy"
+        || r.contains("tcp connect to proxy")
+        || r.contains("connect to proxy")
+        || r.contains("timeout connecting")
+        || r.contains("no route")
+        || r.contains("refused")
 }
 
 /// Advance to next authorized replacement (if any). Returns true on rotation.
@@ -381,23 +385,29 @@ async fn rotate_authorized(
     endpoints: &Arc<Mutex<Vec<Endpoint>>>,
 ) -> bool {
     let mut list = endpoints.lock().unwrap();
-    if list.is_empty() {
+    if list.len() < 2 {
         tracing::warn!(container = %cs.cfg.name, "endpoint invalid but NO authorized replacement configured — staying blocked (fail-closed)");
         return false;
     }
+    let dead = list.remove(0);
     let next = list.remove(0);
     {
         let mut r = cs.rotations.lock().unwrap();
         *r += 1;
         tracing::warn!(container = %cs.cfg.name, rotations = *r,
-                       "AUTHORIZED ROTATION to new endpoint (full re-preflight required)");
+                       from = %dead.url, to = %next.url,
+                       "AUTHORIZED ROTATION to replacement (full re-preflight required)");
     }
     list.insert(0, next); // becomes the active one on next loop iteration
     true
 }
 
 async fn build_jail(cs: &Arc<ContainerState>, proxy: &ProxyUrl) -> Result<NetNs> {
-    let idx = cs_index(&cs.cfg.name);
+    let names = CONTAINER_NAMES
+        .get()
+        .cloned()
+        .unwrap_or_else(|| vec![cs.cfg.name.clone()]);
+    let idx = crate::config::unique_index(&names, &cs.cfg.name);
     let ips = crate::netns::resolve_proxy_ips(&proxy.host)?;
     NetNs::create(&cs.cfg.name, idx, &proxy.host, proxy.port, &ips).await
 }
@@ -491,21 +501,24 @@ async fn spawn_apps(
     procs: &Procs,
     inside_netns: bool,
 ) -> Result<(Option<Child>, Option<Child>)> {
+    // NOTE: in netns mode argv[0] MUST be passed as an argument (after the
+    // `ip netns exec <ns>` prefix) or the workload binary is never launched.
     let wrap = |argv: &[String]| -> tokio::process::Command {
         let mut c = if inside_netns {
             let prefix = procs.netns.as_ref().unwrap().exec_prefix();
             let mut c = tokio::process::Command::new(&prefix[0]);
             c.args(&prefix[1..]);
+            c.args(argv); // program + its args, all inside the jail
             c
         } else {
             // userspace mode: best-effort env forcing (verification still guards us)
             let mut c = tokio::process::Command::new(&argv[0]);
             c.env("ALL_PROXY", all_proxy_env(cs));
             c.env("all_proxy", all_proxy_env(cs));
+            c.args(argv[1..].iter());
             c
         };
-        c.args(argv[1..].iter())
-            .stdin(std::process::Stdio::null())
+        c.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         c

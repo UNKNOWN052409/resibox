@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     }
 
     let mode = container::effective_mode(&g);
+    let _ = container::CONTAINER_NAMES.set(cfg.container.iter().map(|c| c.name.clone()).collect());
     tracing::info!(
         containers = cfg.container.len(),
         enforcement = ?mode,

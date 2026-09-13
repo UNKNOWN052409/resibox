@@ -55,8 +55,8 @@ impl NetNs {
     pub async fn create(
         container: &str,
         index: u8,
-        proxy_host: &str,
-        proxy_port: u16,
+        _proxy_host: &str,
+        _proxy_port: u16,
         proxy_ips: &[String],
     ) -> Result<Self> {
         let a = 10u32 + index as u32; // 10.210+.x keeps us clear of docker defaults
@@ -70,7 +70,7 @@ impl NetNs {
         Self::destroy_stale(container).await;
 
         sh("ip", &["netns", "add", &name])?;
-        if let Err(e) = self_setup(&name, &host_if, &ns_if, &subnet, &host_ip, &ns_ip, proxy_host, proxy_port, proxy_ips).await {
+        if let Err(e) = self_setup(&name, &host_if, &ns_if, &subnet, &host_ip, &ns_ip, proxy_ips).await {
             // fail-closed: never leave a half-built jail around
             let _ = Command::new("ip").args(["netns", "del", &name]).output().await;
             return Err(e);
@@ -83,8 +83,7 @@ impl NetNs {
                 "-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "!",
                 "-d", &subnet, "-j", "MASQUERADE",
             ],
-        )
-        ;   /* host masquerade */
+        );
 
         Ok(Self {
             name,
@@ -94,7 +93,7 @@ impl NetNs {
             host_ip,
             ns_ip,
             proxy_ips: proxy_ips.to_vec(),
-            proxy_port,
+            proxy_port: 0, // informational only; enforcement is IP-based (exempt list)
         })
     }
 
@@ -126,8 +125,6 @@ async fn self_setup(
     subnet: &str,
     host_ip: &str,
     ns_ip: &str,
-    proxy_host: &str,
-    _proxy_port: u16,
     proxy_ips: &[String],
 ) -> Result<()> {
     // Host side veth
@@ -148,12 +145,10 @@ async fn self_setup(
 
     // ---- Egress jail inside the namespace ---------------------------------
     // NAT: exempt the assigned proxy gateway(s), redirect EVERYTHING else.
-    let n = format!("ip netns exec {name} iptables");
     for ip in proxy_ips {
         sh("ip", &["netns", "exec", name, "iptables", "-t", "nat",
             "-A", "OUTPUT", "-p", "tcp", "-d", ip, "-j", "RETURN"])?;
     }
-    let _ = proxy_host; // domain handled by exemption list above
     sh("ip", &["netns", "exec", name, "iptables", "-t", "nat",
         "-A", "OUTPUT", "-p", "tcp", "-j", "REDIRECT", "--to-ports", "18080"])?;
     sh("ip", &["netns", "exec", name, "iptables", "-t", "nat",
@@ -172,6 +167,5 @@ async fn self_setup(
     // (REDIRECTed packets hit -o lo as dst 127.0.0.1 and pass the lo rule.)
 
     tracing::info!(netns = %name, subnet = %subnet, "egress jail built");
-    let _ = n;
     Ok(())
 }

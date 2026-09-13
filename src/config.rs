@@ -170,13 +170,15 @@ impl ContainerCfg {
     pub fn pawns_argv(&self) -> Vec<String> {
         let dev = Self::device_name("PB", &self.pawns_device_name);
         let mut default = vec![
+            "./pawns-cli".to_string(),
             format!("-email={}", self.pawns_email),
             format!("-password={}", self.pawns_pass),
             format!("-device-name={}", dev.clone()),
             "-accept-tos".to_string(),
         ];
-        default.insert(0, "./pawns-cli".to_string());
-        default.retain(|a| !a.ends_with('=') && !a.is_empty());
+        // drop only empty flags, never a value because it ends in '=' —
+        // base64/URL-encoded passwords legitimately end with '='
+        default.retain(|a| !a.is_empty());
         let argv = self.pawns_cmd.clone().unwrap_or(default);
         self.subst(argv, &dev)
     }
@@ -195,6 +197,23 @@ pub fn nanoid6() -> String {
     const AL: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut r = rand::thread_rng();
     (0..6).map(|_| AL[r.gen_range(0..AL.len())] as char).collect()
+}
+
+/// Collision-free subnet/veth index for a container among its peers.
+pub fn unique_index(names: &[String], name: &str) -> u8 {
+    let hash = |n: &str| -> u8 { n.bytes().fold(7u8, |a, b| a.wrapping_mul(31).wrapping_add(b)) % 100 };
+    let want = hash(name);
+    let used: std::collections::HashSet<u8> =
+        names.iter().filter(|n| **n != name).map(|n| hash(n)).collect();
+    if !used.contains(&want) {
+        return want;
+    }
+    for i in 0..=99u8 {
+        if !used.contains(&i) {
+            return i;
+        }
+    }
+    want
 }
 
 pub fn load(path: &str) -> Result<Config> {
