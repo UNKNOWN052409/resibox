@@ -5,6 +5,21 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// __inner mode override: reach the proxy gateway DIRECTLY by this IP.
+/// Inside a netns the proxy host's DNS resolution would be REDIRECTed into
+/// our own DNS relay (which needs the proxy to answer) - a recursion
+/// deadlock. The supervisor passes the host-resolved gateway IP instead.
+pub static GATEWAY_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn gateway_addr(p: &ProxyUrl) -> std::io::Result<std::net::SocketAddr> {
+    if let Some(ip) = GATEWAY_OVERRIDE.get() {
+        if let Ok(a) = format!("{ip}:{}", p.port).parse::<std::net::SocketAddr>() {
+            return Ok(a);
+        }
+    }
+    resolve_inline(&p.host, p.port)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProxyType {
     Socks5,
@@ -111,7 +126,7 @@ pub async fn connect_through(
 }
 
 async fn socks5_connect(p: &ProxyUrl, host: &str, port: u16) -> Result<TcpStream> {
-    let addr = resolve_inline(&p.host, p.port)?;
+    let addr = gateway_addr(p)?;
     let mut s = TcpStream::connect(addr)
         .await
         .with_context(|| format!("tcp connect to proxy {}:{}", p.host, p.port))?;
@@ -175,7 +190,7 @@ async fn socks5_connect(p: &ProxyUrl, host: &str, port: u16) -> Result<TcpStream
 }
 
 async fn http_connect(p: &ProxyUrl, host: &str, port: u16) -> Result<TcpStream> {
-    let addr = resolve_inline(&p.host, p.port)?;
+    let addr = gateway_addr(p)?;
     let mut s = TcpStream::connect(addr)
         .await
         .with_context(|| format!("tcp connect to proxy {}:{}", p.host, p.port))?;

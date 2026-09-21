@@ -85,6 +85,7 @@ fn original_dst(sock: &tokio::net::TcpStream) -> Option<(String, u16)> {
 }
 
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct libc_sockaddr_in {
     sin_family: u16,
     sin_port: u16,
@@ -92,10 +93,12 @@ struct libc_sockaddr_in {
     pad: [u8; 8],
 }
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct sin_addr_raw {
     s_addr: u32,
 }
 
+#[cfg(target_os = "linux")]
 extern "C" {
     fn getsockopt(
         fd: i32,
@@ -106,6 +109,7 @@ extern "C" {
     ) -> i32;
 }
 
+#[cfg(target_os = "linux")]
 #[inline]
 fn raw_getsockopt(fd: i32, lvl: i32, name: i32, v: *mut u8, l: &mut u32) -> i32 {
     unsafe { getsockopt(fd, lvl, name, v, l) }

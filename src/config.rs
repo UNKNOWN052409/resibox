@@ -153,7 +153,14 @@ impl ContainerCfg {
     }
 
     /// Honeygain argv with placeholders substituted.
+    /// Opt-out: with no custom `hg_cmd` AND no `honeygain_email`, return an
+    /// empty argv — container::spawn_apps treats that as "do not spawn".
+    /// This is what lets a container host a GENERIC workload (e.g. a Node
+    /// server via `hg_cmd = ["node", "server.js"]`) with no earner at all.
     pub fn hg_argv(&self) -> Vec<String> {
+        if self.hg_cmd.is_none() && self.honeygain_email.trim().is_empty() {
+            return Vec::new();
+        }
         let dev = Self::device_name("HG", &self.honeygain_device);
         let default = vec![
             "./honeygain".into(),
@@ -167,7 +174,11 @@ impl ContainerCfg {
     }
 
     /// Pawns.app CLI argv with placeholders substituted.
+    /// Opt-out mirrors hg_argv: no `pawns_cmd` AND no `pawns_email` => not spawned.
     pub fn pawns_argv(&self) -> Vec<String> {
+        if self.pawns_cmd.is_none() && self.pawns_email.trim().is_empty() {
+            return Vec::new();
+        }
         let dev = Self::device_name("PB", &self.pawns_device_name);
         let mut default = vec![
             "./pawns-cli".to_string(),

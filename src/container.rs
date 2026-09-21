@@ -191,13 +191,12 @@ pub async fn run_container(cs: Arc<ContainerState>, g: Arc<General>, baseline: O
                 *cs.last_error.lock().unwrap() = reason.clone();
                 tracing::error!(container = %cs.cfg.name, %reason, "PRE-FLIGHT FAIL — workload stays STOPPED");
 
-                if should_rotate(&cs, &reason).await {
-                    if rotate_authorized(&cs, &endpoints).await {
+                if should_rotate(&cs, &reason).await
+                    && rotate_authorized(&cs, &endpoints).await {
                         teardown(&mut procs).await;
                         cs.set_sync(State::Rotating);
                         continue 'outer;
                     }
-                }
                 teardown(&mut procs).await;
                 hard_block(&cs, &mut procs, reason).await;
                 sleep_backoff(g.verify_interval_secs).await;
@@ -312,13 +311,12 @@ pub async fn run_container(cs: Arc<ContainerState>, g: Arc<General>, baseline: O
                     kill_apps(&mut procs).await;
                     cs.set_sync(State::Isolated);
 
-                    if fails >= g.max_consecutive_failures && should_rotate(&cs, &reason).await {
-                        if rotate_authorized(&cs, &endpoints).await {
+                    if fails >= g.max_consecutive_failures && should_rotate(&cs, &reason).await
+                        && rotate_authorized(&cs, &endpoints).await {
                             teardown(&mut procs).await;
                             cs.set_sync(State::Rotating);
                             continue 'outer;
                         }
-                    }
 
                     // Revalidate same endpoint; resume ONLY after a clean pass.
                     match verify(&proxy, &ep.policy, &baseline, &g).await {
@@ -408,11 +406,23 @@ async fn build_jail(cs: &Arc<ContainerState>, proxy: &ProxyUrl) -> Result<NetNs>
         .cloned()
         .unwrap_or_else(|| vec![cs.cfg.name.clone()]);
     let idx = crate::config::unique_index(&names, &cs.cfg.name);
-    let ips = crate::netns::resolve_proxy_ips(&proxy.host)?;
+    // iptables (v4) rules cannot carry IPv6 addresses - an AAAA answer for the
+    // proxy gateway would break jail creation. Keep A records only; refuse
+    // IPv6-only gateways (fail-closed, same policy as the rest of the jail).
+    let ips: Vec<String> = crate::netns::resolve_proxy_ips(&proxy.host)?
+        .into_iter()
+        .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+        .collect();
+    if ips.is_empty() {
+        anyhow::bail!(
+            "proxy host {} has no IPv4 address; the netns jail is iptables-based (IPv4)",
+            proxy.host
+        );
+    }
     NetNs::create(&cs.cfg.name, idx, &proxy.host, proxy.port, &ips).await
 }
 
-fn device_state_path(name: &str) -> std::path::PathBuf {
+fn device_state_path(_name: &str) -> std::path::PathBuf {
     let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     std::path::Path::new(&dir).join(".resibox-devices")
 }
@@ -456,12 +466,6 @@ fn rotate_sticky(url: &str) -> Option<String> {
     Some(format!("{}{}{}", &url[..start], fresh, &url[start + digits..]))
 }
 
-fn cs_index(name: &str) -> u8 {
-    // stable small index from name for subnet allocation
-    let h = name.bytes().fold(7u8, |a, b| a.wrapping_mul(31).wrapping_add(b));
-    h % 100
-}
-
 async fn spawn_inner(ns: &NetNs, proxy: &ProxyUrl, resolvers: Vec<String>) -> Result<Child> {
     let exe = std::env::current_exe()?;
     let prefix = ns.exec_prefix();
@@ -476,6 +480,13 @@ async fn spawn_inner(ns: &NetNs, proxy: &ProxyUrl, resolvers: Vec<String>) -> Re
             "127.0.0.1:5353",
             "--proxy",
             &format!("{}://{}", proto_of(proxy), sockstr(proxy)),
+        ])
+        // Direct gateway IP for the inner dialer: inside the ns the proxy
+        // host's own DNS would be REDIRECTed into our DNS relay, which dials
+        // the proxy... recursion deadlock. Break it with the host-resolved IP.
+        .args([
+            "--proxy-ip",
+            ns.proxy_ips.first().map(String::as_str).unwrap_or(""),
         ])
         .args(["--resolvers", &resolvers.join(",")])
         .stdout(std::process::Stdio::inherit())
@@ -566,27 +577,22 @@ async fn scan_output(cs: Arc<ContainerState>, tag: &str, stream: impl tokio::io:
     use tokio::io::{AsyncBufReadExt, BufReader};
     let reader = BufReader::new(stream);
     let mut lines = reader.lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                tracing::info!(container = %cs.cfg.name, app = tag, "{}", line);
-                let lower = line.to_lowercase();
-                if lower.contains("choose a different device name") {
-                    *cs.device_conflict.lock().unwrap() = true;
-                    tracing::warn!(container = %cs.cfg.name,
-                                   "DEVICE CONFLICT: server still holds old session; will rotate device id");
-                }
-                if lower.contains("overused") {
-                    *cs.overuse_hits.lock().unwrap() += 1;
-                    tracing::warn!(container = %cs.cfg.name,
-                                   hits = *cs.overuse_hits.lock().unwrap(),
-                                   "PROVIDER SIGNAL: network overused");
-                }
-                if lower.contains("connected") && lower.contains("running") {
-                    *cs.overuse_hits.lock().unwrap() = 0;
-                }
-            }
-            _ => break,
+    while let Ok(Some(line)) = lines.next_line().await {
+        tracing::info!(container = %cs.cfg.name, app = tag, "{}", line);
+        let lower = line.to_lowercase();
+        if lower.contains("choose a different device name") {
+            *cs.device_conflict.lock().unwrap() = true;
+            tracing::warn!(container = %cs.cfg.name,
+                           "DEVICE CONFLICT: server still holds old session; will rotate device id");
+        }
+        if lower.contains("overused") {
+            *cs.overuse_hits.lock().unwrap() += 1;
+            tracing::warn!(container = %cs.cfg.name,
+                           hits = *cs.overuse_hits.lock().unwrap(),
+                           "PROVIDER SIGNAL: network overused");
+        }
+        if lower.contains("connected") && lower.contains("running") {
+            *cs.overuse_hits.lock().unwrap() = 0;
         }
     }
 }
@@ -621,9 +627,9 @@ fn rewrite(argv: &mut [String], dev: &str) {
             if let Some(slot) = argv.get_mut(i + 1) {
                 *slot = dev.to_string();
             }
-        } else if let Some(rest) = a.strip_prefix("-device=") {
+        } else if let Some(_rest) = a.strip_prefix("-device=") {
             argv[i] = format!("-device={dev}");
-        } else if let Some(rest) = a.strip_prefix("-device-name=") {
+        } else if let Some(_rest) = a.strip_prefix("-device-name=") {
             argv[i] = format!("-device-name={dev}");
         }
         i += 1;

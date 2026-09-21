@@ -4,7 +4,7 @@
 //! Honeygain + Pawns.app run inside each jail. Fail-closed by construction.
 
 use anyhow::{Context, Result};
-use resibox::{config, container, health, verify};
+use resibox::{config, container, health, proxy, verify};
 use std::sync::Arc;
 
 #[tokio::main(flavor = "current_thread")]
@@ -23,10 +23,14 @@ async fn main() -> Result<()> {
         return inner_main(&args).await;
     }
 
-    let cfg_path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "config.toml".to_string());
+    // Accept both `resibox config.toml` (positional) and `--config config.toml`.
+    // (Flag form previously fell through to reading a file literally named
+    // "--config" — a confusing error, hence explicit support here.)
+    let cfg_path = match args.get(1).map(|s| s.as_str()) {
+        Some("--config") => args.get(2).cloned().unwrap_or_default(),
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => "config.toml".to_string(),
+    };
     let cfg = Arc::new(config::load(&cfg_path).context("config load")?);
     let g = Arc::new(cfg.general.clone());
 
@@ -106,6 +110,11 @@ async fn inner_main(args: &[String]) -> Result<()> {
     let bind = get("--bind").unwrap_or_else(|| "127.0.0.1:18080".into());
     let dns_bind = get("--dns-bind").unwrap_or_else(|| "127.0.0.1:5353".into());
     let proxy = get("--proxy").context("--proxy required in __inner mode")?;
+    // Supervisor-resolved gateway IP: breaks the DNS recursion deadlock inside
+    // the ns (see proxy.rs::GATEWAY_OVERRIDE). Empty/absent = resolve normally.
+    if let Some(ip) = get("--proxy-ip").filter(|s| !s.is_empty()) {
+        let _ = proxy::GATEWAY_OVERRIDE.set(ip);
+    }
     let resolvers: Vec<String> = get("--resolvers")
         .unwrap_or_else(|| "9.9.9.9:53,1.1.1.1:53".into())
         .split(',')
